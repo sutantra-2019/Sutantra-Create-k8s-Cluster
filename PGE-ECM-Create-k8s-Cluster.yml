@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NO UPDATES. Create an EKS cluster. Initial config.
+  Version: 0.0.2 - working on K8S authentication.
+  Author: gagarin.dev'
+
+Parameters:    # =============[ PARAMETERS ]==========================
+
+  pTagEnvironmentType:
+    Type: String
+    Default: Development
+    AllowedValues:
+      - Development
+      - QA
+      - Production      
+    Description: 'Development or QA or Production Environment.'
+
+  pTagNotifyEmail:
+    Description: Email address for 'Notify' tags
+    Default: "auc8@pge.com"
+    Type: String
+
+  pTagProjectName:
+    Description: Name of the Project
+    Default: PGE-ECM-Migration
+    Type: String
+
+  pEksClusterName:
+    Description: Name of the EKS cluster.
+    Default: PGE-ECM-K8s-Dev
+    Type: String
+    
+  pUpdateEKSVersion:
+    Description: Update the EKS Version - Support Values Are Yes or No.
+    Default: No
+    Type: String
+
+  pK8sApiEndpointAccessMode:
+    Description: Kubernetes API Server Endpoint Access mode.  # https://docs.aws.amazon.com/eks/latest/userguide/cluster-endpoint.html
+    Default: private
+    AllowedValues:
+      - private
+      - public
+      - private_and_public
+    Type: String
+
+  pEksVersion:  # https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html
+    Description: Amazon EKS Kubernetes Version (e.g. '1.16').
+    Default: '1.16'
+    Type: String
+    
+  pLambdaFunctionName:
+    Description: Lambda Function To Create the EKS Cluster using Boto3
+    Default: PGE-ECM-Create-k8s-Cluster
+    Type: String    
+
+  pEksLogging:
+    Type: String
+    Default: enable
+    AllowedValues: 
+      - enable
+      - disable
+    Description: Enable or disable exporting the Kubernetes control plane logs for the cluster to CloudWatch Logs.
+
+  pListOfClusterSubnets:
+    Type: "List<AWS::EC2::Subnet::Id>"
+    Default: subnet-0fe38e11b83f41807,subnet-0f63aa3caf80d6095,subnet-0f1370fcdde0b76bd,subnet-09abb2a811197f84d,subnet-04c156f47212c3ae1,subnet-04bb15cc110768745,subnet-04871bcbdbb59ee49,subnet-032f8ab2f41c18469,subnet-007d578793b15e398
+    Description: The subnets for EKS Cluster to use. (e.g. subnet-0fc6da98b9f4010d2)
+
+  pListOfClusterSecurityGroupIds:
+    Description: Choose the security groups for EKS Cluster to use (e.g. sg-03f6cebbbdacd9629)
+    Default: sg-0306373e333ac9633,sg-058d8abe396755c6e,sg-0c23aed3100361a1a,sg-0baa27c5bf00f2602
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+Resources:    # ==============[ RESOURCES ]==========================
+
+# - - - - - - - - - - - - - - - - - - - - - - - -
+  # Amazon EKS Service IAM Role, https://docs.aws.amazon.com/eks/latest/userguide/service_IAM_role.html
+  rEKSClusterRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub eksServiceRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy    # provides Kubernetes the permissions it requires to manage resources on your behalf
+        - arn:aws:iam::aws:policy/AmazonEKSServicePolicy    # allows Amazon Elastic Container Service for Kubernetes to create and manage the necessary resources to operate EKS Clusters
+      Path: /
+      Tags:
+        - { Key: Environment, Value: !Ref pTagEnvironmentType }
+        - { Key: Notify, Value: !Ref pTagNotifyEmail }
+        - { Key: ProjectName, Value: !Ref pTagProjectName }
+
+# - - - - - - - - - - - - - - - - - - - - - - - -
+  # IAM Role for the LAMBDA, that backs the Create EKS Cluster Custom Resource
+  rEksClusterCustomResourceLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "eksCluster-Create-LambdaExecutionRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+            AWS:
+            - 'arn:aws:iam::138871512076:role/ECM_Ops'
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub "eksCluster-Create-LambdaExecutionPolicy-${pTagEnvironmentType}"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: "Allow"
+              Action:
+                - eks:*
+              Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${pEksClusterName}
+            -
+              Effect: Allow  # CloudWatch
+              Action:
+                - logs:CreateLogStream
+                - logs:CreateLogGroup
+                - logs:PutLogEvents
+                - sts:GetCallerIdentity  # for K8S access
+              Resource: '*'
+            -
+              Effect: Allow  # PassExecutionRole
+              Action:
+                - iam:PassRole
+              Resource: !GetAtt rEKSClusterRole.Arn
+
+  # - - - - - - - - - - - - - - - - - - - - - - - -
+  # Custom Resource Lambda, when called:
+  # - creates an EKS Cluster
+  # - adds a specified IAM Role to K8S system:masters
+  rAmiShareLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref pLambdaFunctionName
+      Description: Creates an EKS Cluster, configures with initial access
+      Handler: index.Create_k8S_Cluster
+      Role: !GetAtt rEksClusterCustomResourceLambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import cfnresponse
+          def Create_k8S_Cluster(event, context):
+            import json, boto3
+            print(event)
+            status = cfnresponse.SUCCESS
+            physical_id = event.get('PhysicalResourceId')
+            eksObj = boto3.client('eks')
+            print("Reqeust Type ==>",event['RequestType'])
+            try:
+              if event['RequestType'] == 'Create':
+                print("I am inside of Create ==>")
+                response = eksObj.create_cluster(
+                name= event['ResourceProperties']['keyEksClusterName'],
+                version= event['ResourceProperties']['keyEksVersion'],
+                roleArn= event['ResourceProperties']['keyEKSClusterRoleArn'],
+                resourcesVpcConfig={
+                  'subnetIds': event['ResourceProperties']['keyListOfClusterSubnets'],
+                  'securityGroupIds': event['ResourceProperties']['keyListOfClusterSecurityGroupIds'],
+                  'endpointPublicAccess': bool(event['ResourceProperties']['keyEndPointPublicAccess']),
+                  'endpointPrivateAccess': bool(event['ResourceProperties']['keyEndPointPrivateAccess'])},
+                logging={'clusterLogging':[{'types':['api','audit','authenticator','controllerManager','scheduler'],'enabled': True}]},
+                tags=event['ResourceProperties']['keyTags']
+                )
+              if event['RequestType'] == 'Update':
+                print("I am inside of Update ==>")
+                response = eksObj.update_cluster_config(
+                name= event['ResourceProperties']['keyEksClusterName'],
+                resourcesVpcConfig={
+                  'subnetIds': event['ResourceProperties']['keyListOfClusterSubnets'],
+                  'securityGroupIds': event['ResourceProperties']['keyListOfClusterSecurityGroupIds'],
+                  'endpointPublicAccess': bool(event['ResourceProperties']['keyEndPointPublicAccess']),
+                  'endpointPrivateAccess': bool(event['ResourceProperties']['keyEndPointPrivateAccess'])},
+                logging={'clusterLogging':[{'types':['api','audit','authenticator','controllerManager','scheduler'],'enabled': True}]}
+                )
+                if event['ResourceProperties']['keyUpdateEKSVersion'] == 'Yes':
+                  response = eksObj.update_cluster_version(name=event['ResourceProperties']['keyEksClusterName'],version=event['ResourceProperties']['keyEksVersion'])                  
+              if event['RequestType'] == 'Delete':
+                print("I am inside of Delete ==>")
+                response = eksObj.delete_cluster(name=event['ResourceProperties']['keyEksClusterName'])
+            except Exception as Err:
+              print("Failed In Lambda")
+              print("OS error: {0}".format(Err))
+              status = cfnresponse.FAILED
+            finally:
+              cfnresponse.send(event, context, status, {}, physicalResourceId=physical_id)
+      Timeout: 900
+      MemorySize: 128
+      Runtime: python3.6
+      Tags:
+        - { Key: Environment, Value: !Ref pTagEnvironmentType }
+        - { Key: Notify, Value: !Ref pTagNotifyEmail }
+        - { Key: ProjectName, Value: !Ref pTagProjectName }
+
+
+# - - - - - - - - - - - - - - - - - - - - - - - -
+  # Custom resource, which creates and configures an EKS Cluster
+  rEksClusterCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt rAmiShareLambdaFunction.Arn
+      # Custom arbitrary properties:
+      keyEksClusterName: !Ref pEksClusterName  # Name of the Cluster
+      keyEksVersion: !Ref pEksVersion  # EKS version, e.g. '1.14'
+      keyK8sApiEndpointAccessMode: !Ref pK8sApiEndpointAccessMode  # Kubernetes API Endpoint accesss: 'private', 'public' or 'both'
+      keyEKSClusterRoleArn: !GetAtt rEKSClusterRole.Arn  # Amazon EKS Service IAM Role (ARN)
+      keyEksLogging: !Ref pEksLogging # Enable or disable K8S logging to CloudWatch Logs.
+      keyListOfClusterSubnets: !Ref pListOfClusterSubnets
+      keyListOfClusterSecurityGroupIds: !Ref pListOfClusterSecurityGroupIds
+      keyEndPointPublicAccess: False
+      keyEndPointPrivateAccess: True
+      keyUpdateEKSVersion: !Ref pUpdateEKSVersion      
+      keyTags:
+        Environment: !Ref pTagEnvironmentType
+        Notify: !Ref pTagNotifyEmail
+        ProjectName: !Ref pTagProjectName
+
+
+Outputs:    # ==============[ OUTPUTS ]==========================
+
+  oEKSClusterRoleArn:
+    Description: ARN of the 'rEKSClusterRole' IAM role
+    Value: !GetAtt rEKSClusterRole.Arn
